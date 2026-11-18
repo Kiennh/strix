@@ -1,0 +1,20 @@
+{
+  "name": "strix",
+  "owner": {
+    "name": "Strix contributors",
+    "url": "https://github.com/usestrix/strix"
+  },
+  "metadata": {
+    "description": "Strix autonomous pentesting as a Claude Code agent team."
+  },
+  "plugins": [
+    {
+      "name": "strix",
+      "source": "./",
+      "version": "0.1.0",
+      "description": "Run /strix <target> to launch a wave-based team of security subagents (recon, code mapping, SAST triage, hunters, validators, reporters) and get a validated pentest report.",
+      "category": "security",
+      "keywords": ["security", "pentest", "vulnerability", "appsec"]
+    }
+  ]
+}

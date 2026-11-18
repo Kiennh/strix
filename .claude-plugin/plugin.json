@@ -1,0 +1,13 @@
+{
+  "name": "strix",
+  "version": "0.1.0",
+  "description": "Run Strix-style autonomous penetration tests as a Claude Code team: a lead session orchestrates architect, recon, code-mapper, SAST-triage, hunter, validator, reporter and checker subagents, driven by /strix.",
+  "author": {
+    "name": "Strix contributors",
+    "url": "https://github.com/usestrix/strix"
+  },
+  "homepage": "https://strix.ai",
+  "repository": "https://github.com/usestrix/strix",
+  "license": "Apache-2.0",
+  "keywords": ["security", "pentest", "vulnerability", "appsec", "agents"]
+}
