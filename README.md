@@ -149,6 +149,32 @@ This installs nine skills for running pentests, fixing findings, and CI scanning
 
 See [`AGENTS.md`](AGENTS.md) for the quick reference, [docs.strix.ai/llms.txt](https://docs.strix.ai/llms.txt) for the CLI, and [docs.app.strix.ai](https://docs.app.strix.ai) for the API.
 
+### Run Strix as a native Claude Code team (no Docker, no separate LLM key)
+
+The skills above teach an agent to drive the `strix` CLI/cloud — a separate engine with its own Docker sandbox and LLM key. For running inside Claude Code itself, this repo is also a **Claude Code plugin** (`strix`) that reimplements the same multi-agent pentest workflow as a team of Claude Code subagents, using the current session's own models and quota:
+
+```bash
+# From a Claude Code session, with a local checkout of this repo:
+claude --plugin-dir /path/to/strix
+# or, from a running session:
+/plugin marketplace add /path/to/strix   # local path or git remote hosting this plugin
+/plugin install strix
+```
+
+Then run:
+
+```
+/strix https://staging.example.com
+/strix ./my-app --mode quick
+/strix ./app http://localhost:3000 --instruction "Test accounts: user1/user2 (role user, different tenants), admin1 (role admin). Check for IDOR and vertical privilege escalation."
+```
+
+- `--mode quick|standard|deep` (default `standard`), `--instruction "text"` (focus areas, test credentials, tenancy model), `--authorized` (skip the confirmation prompt for remote targets you already confirmed), `--static-only` (no live traffic, no running target code), `--run-code` (allow running a cloned repo locally), `--max-agents N`.
+- Non-local targets trigger an authorization confirmation unless `--authorized` is passed. Cloned repos are static-only unless `--run-code` is given.
+- Roles map onto model tiers instead of one LLM for everything: [`strix-architect`](agents/strix-architect.md) (threat model + planning) runs on **Opus**; [`strix-recon`](agents/strix-recon.md), [`strix-code-mapper`](agents/strix-code-mapper.md), [`strix-sast-triage`](agents/strix-sast-triage.md), [`strix-hunter`](agents/strix-hunter.md), [`strix-validator`](agents/strix-validator.md), and [`strix-reporter`](agents/strix-reporter.md) run on **Sonnet**; [`strix-checker`](agents/strix-checker.md) (the QA gate) runs on **Haiku**.
+- Output lands in `strix_runs/<run-name>/`, with the same artifact shapes as the CLI: `penetration_test_report.md`, `vulnerabilities/*.md`, `vulnerabilities.json`/`.csv`, `findings.sarif`.
+- Playbook, file schemas, and design rationale: [`skills/strix-team/SKILL.md`](skills/strix-team/SKILL.md) and [`skills/strix-team/references/`](skills/strix-team/references/). Helper CLI used internally (`init`/`preflight`/`cvss`/`verify`/`status`/`assemble`): [`skills/strix-team/scripts/strix_team.py`](skills/strix-team/scripts/strix_team.py).
+
 ---
 
 ## ✨ Features
