@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import importlib.util
 import itertools
 import json
 import re
 import shutil
+import ssl
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -450,6 +453,193 @@ def test_cvss_cli_json_and_exit_codes(capsys: pytest.CaptureFixture[str]) -> Non
     with pytest.raises(SystemExit) as excinfo:
         st.main(["cvss", "N", "L"])
     assert excinfo.value.code == 2
+
+
+# --------------------------------------------------------------------------- cve-search
+
+
+def _nvd_payload(*items: tuple[str, float | None, str]) -> dict[str, Any]:
+    """Build a minimal NVD CVE API 2.0 response for ``(id, cvss_score, published)`` rows."""
+    vulns = []
+    for cve_id, score, published in items:
+        metrics = (
+            {"cvssMetricV31": [{"baseSeverity": "HIGH", "cvssData": {"baseScore": score}}]}
+            if score is not None
+            else {}
+        )
+        vulns.append(
+            {
+                "cve": {
+                    "id": cve_id,
+                    "published": published,
+                    "descriptions": [{"lang": "en", "value": f"{cve_id} summary"}],
+                    "metrics": metrics,
+                    "references": [{"url": f"https://example.test/{cve_id}"}],
+                }
+            }
+        )
+    return {"totalResults": len(vulns), "vulnerabilities": vulns}
+
+
+def test_cve_search_queries_nvd_and_ranks_by_score_then_recency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_urls = []
+
+    def fake_get(url: str, *, timeout: float) -> dict[str, Any]:
+        captured_urls.append(url)
+        assert timeout > 0
+        return _nvd_payload(
+            ("CVE-2020-0001", 5.0, "2020-01-01T00:00:00.000"),
+            ("CVE-2026-9999", 9.8, "2026-01-01T00:00:00.000"),
+            ("CVE-2021-0002", 9.8, "2021-01-01T00:00:00.000"),
+        )
+
+    monkeypatch.setattr(st, "_http_get_json", fake_get)
+    data, code = st.cmd_cve_search(argparse.Namespace(product="cPanel WHM", version="11.140"))
+
+    assert code == 0
+    assert data["product"] == "cPanel WHM"
+    assert data["version"] == "11.140"
+    assert data["query"] == "cPanel WHM 11.140"
+    normalized_url = captured_urls[0].replace("+", " ")
+    assert "keywordSearch=cPanel" in normalized_url
+    ranked_ids = [row["id"] for row in data["results"]]
+    # Highest CVSS first; ties broken by most recent publish date first.
+    assert ranked_ids == ["CVE-2026-9999", "CVE-2021-0002", "CVE-2020-0001"]
+    assert data["results"][0]["severity"] == "high"
+    assert data["results"][0]["references"] == ["https://example.test/CVE-2026-9999"]
+
+
+def test_cve_search_no_version_omits_it_from_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_get(_url: str, *, timeout: float) -> dict[str, Any]:
+        assert timeout > 0
+        return _nvd_payload()
+
+    monkeypatch.setattr(st, "_http_get_json", fake_get)
+    data, code = st.cmd_cve_search(argparse.Namespace(product="Jenkins", version=""))
+    assert code == 0
+    assert data["query"] == "Jenkins"
+    assert data["version"] is None
+    assert data["results"] == []
+    assert data["total_results"] == 0
+
+
+def test_cve_search_caps_results_and_handles_missing_score(monkeypatch: pytest.MonkeyPatch) -> None:
+    published = "2026-06-01T00:00:00.000"
+    items = [(f"CVE-2026-{1000 + n}", None if n == 0 else float(n), published) for n in range(20)]
+
+    def fake_get(_url: str, *, timeout: float) -> dict[str, Any]:
+        assert timeout > 0
+        return _nvd_payload(*items)
+
+    monkeypatch.setattr(st, "_http_get_json", fake_get)
+    data, _code = st.cmd_cve_search(argparse.Namespace(product="Widget", version=""))
+    assert len(data["results"]) == st._CVE_SEARCH_MAX_RESULTS
+    ranked_ids = {row["id"] for row in data["results"]}
+    assert "CVE-2026-1000" not in ranked_ids, "zero-score item should rank last and get cut"
+
+
+def test_cve_search_rejects_non_https_urls() -> None:
+    with pytest.raises(ValueError, match="non-https"):
+        st._http_get_json("http://example.test/cves", timeout=5)
+
+
+def _ssl_url_error() -> Any:
+    return urllib.error.URLError(ssl.SSLCertVerificationError("CERTIFICATE_VERIFY_FAILED"))
+
+
+def test_http_get_json_falls_back_to_curl_on_ssl_trust_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken_urllib(_url: str, *, timeout: float) -> dict[str, Any]:
+        assert timeout > 0
+        raise _ssl_url_error()
+
+    captured_cmd: list[str] = []
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured_cmd.extend(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout='{"ok": true}', stderr="")
+
+    monkeypatch.setattr(st, "_http_get_json_urllib", broken_urllib)
+    monkeypatch.setattr(st.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(st.subprocess, "run", fake_run)
+
+    result = st._http_get_json("https://example.test/cves", timeout=15)
+    assert result == {"ok": True}
+    assert captured_cmd[0] == "/usr/bin/curl"
+    assert "https://example.test/cves" in captured_cmd
+
+
+def test_http_get_json_non_ssl_error_does_not_fall_back_to_curl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken_urllib(_url: str, *, timeout: float) -> dict[str, Any]:
+        assert timeout > 0
+        raise urllib.error.URLError("connection refused")
+
+    def must_not_run(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        msg = "curl should not be invoked for a non-SSL error"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(st, "_http_get_json_urllib", broken_urllib)
+    monkeypatch.setattr(st.subprocess, "run", must_not_run)
+
+    with pytest.raises(urllib.error.URLError, match="connection refused"):
+        st._http_get_json("https://example.test/cves", timeout=15)
+
+
+def test_http_get_json_curl_fallback_missing_curl_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken_urllib(_url: str, *, timeout: float) -> dict[str, Any]:
+        assert timeout > 0
+        raise _ssl_url_error()
+
+    monkeypatch.setattr(st, "_http_get_json_urllib", broken_urllib)
+    monkeypatch.setattr(st.shutil, "which", lambda _name: None)
+
+    with pytest.raises(OSError, match="curl is not on PATH"):
+        st._http_get_json("https://example.test/cves", timeout=15)
+
+
+def test_http_get_json_curl_fallback_nonzero_exit_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken_urllib(_url: str, *, timeout: float) -> dict[str, Any]:
+        assert timeout > 0
+        raise _ssl_url_error()
+
+    def failing_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 22, stdout="", stderr="curl: (22) HTTP 404")
+
+    monkeypatch.setattr(st, "_http_get_json_urllib", broken_urllib)
+    monkeypatch.setattr(st.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(st.subprocess, "run", failing_run)
+
+    with pytest.raises(OSError, match="curl exited 22"):
+        st._http_get_json("https://example.test/cves", timeout=15)
+
+
+def test_cve_search_network_error_surfaces_as_exit_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def boom(_url: str, *, timeout: float) -> dict[str, Any]:
+        assert timeout > 0
+        msg = "simulated network failure"
+        raise OSError(msg)
+
+    monkeypatch.setattr(st, "_http_get_json", boom)
+    code, data = run_cli(capsys, "cve-search", "cPanel WHM", "--version", "11.140", "--json")
+    assert code == 1
+    assert "simulated network failure" in data["error"]
+
+
+def test_cve_search_cli_registers_in_parser() -> None:
+    parser = st.build_parser()
+    args = parser.parse_args(["cve-search", "Grafana", "--version", "8.3.0"])
+    assert args.command == "cve-search"
+    assert args.product == "Grafana"
+    assert args.version == "8.3.0"
+    args_no_version = parser.parse_args(["cve-search", "Jenkins"])
+    assert args_no_version.version == ""
 
 
 # --------------------------------------------------------------------------- mini YAML

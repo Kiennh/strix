@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run-directory helper for the Strix Claude Code team plugin.
 
-Subcommands: ``init``, ``preflight``, ``cvss``, ``verify``, ``status``, ``assemble``.
+Subcommands: ``init``, ``preflight``, ``cvss``, ``cve-search``, ``verify``, ``status``,
+``assemble``.
 
 Standard library only (Python 3.12). Human output goes to stdout; ``--json`` (or a
 non-TTY stdout) switches every subcommand to JSON. Exit codes: ``0`` ok, ``1`` error,
@@ -19,8 +20,12 @@ import math
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import UTC, datetime
 from importlib.util import find_spec
 from pathlib import Path
@@ -638,6 +643,131 @@ def cmd_preflight(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 def cmd_cvss(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     """Compute a CVSS 3.1 base score from eight metric letters."""
     return cvss(*args.metrics), 0
+
+
+# --------------------------------------------------------------------------- cve-search
+#
+# A deterministic, structured alternative to an agent freely web-searching for CVEs on a
+# fingerprinted product: query the NVD CVE API by keyword and return a short, ranked,
+# machine-parsed list (id, score, severity, summary, references) instead of LLM-parsed
+# search-result prose. Used by strix-architect (Wave 2) and strix-hunter for a `CVE lookup`
+# plan.md row. Not a replacement for trivy/create_dependency_report on pinned dependencies
+# — this is for the live product+version fingerprints recon captures that have no lockfile
+# entry (an appliance, a CMS, a server banner).
+
+_NVD_CVE_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+_CVE_SEARCH_TIMEOUT_SECONDS = 15.0
+_CVE_SEARCH_RESULTS_PER_PAGE = 60
+_CVE_SEARCH_MAX_RESULTS = 15
+_CVE_SEARCH_SUMMARY_CHARS = 300
+_CVE_SEARCH_MAX_REFERENCES = 3
+_CVE_SEARCH_USER_AGENT = "strix-team-claude-code-plugin (security research; see repo README)"
+
+
+def _http_get_json_urllib(url: str, *, timeout: float) -> dict[str, Any]:
+    """Fetch ``url`` as JSON via urllib, using the Python interpreter's own trust store."""
+    # Scheme checked by the caller; fixed NVD host. Both calls below are flagged by S310
+    # ("audit url open for permitted schemes") and are intentionally exempted.
+    request = urllib.request.Request(url, headers={"User-Agent": _CVE_SEARCH_USER_AGENT})  # noqa: S310
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+        payload = response.read().decode("utf-8")
+    return json.loads(payload)  # type: ignore[no-any-return]
+
+
+def _http_get_json_curl(url: str, *, timeout: float) -> dict[str, Any]:
+    """Fall back to curl's own trust store when the interpreter's cannot verify the cert.
+
+    A Python build with no CA bundle wired up (common on a bare `python3 -m venv`, some
+    minimal container images) fails every HTTPS request with CERTIFICATE_VERIFY_FAILED
+    even though the host's own TLS trust store is fine — `curl` uses that trust store
+    directly and works. Only used as a fallback for that specific failure, not a general
+    retry path.
+    """
+    curl = shutil.which("curl")
+    if curl is None:
+        msg = "https request failed (interpreter TLS trust store) and curl is not on PATH"
+        raise OSError(msg)
+    result = subprocess.run(  # noqa: S603
+        [curl, "-fsSL", "--max-time", str(max(1, int(timeout))), "-A", _CVE_SEARCH_USER_AGENT, url],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        msg = f"curl exited {result.returncode}: {result.stderr.strip() or 'no output'}"
+        raise OSError(msg)
+    return json.loads(result.stdout)  # type: ignore[no-any-return]
+
+
+def _http_get_json(url: str, *, timeout: float) -> dict[str, Any]:
+    """Fetch ``url`` as JSON. Kept as one call so tests can stub the network boundary."""
+    if not url.startswith("https://"):
+        msg = f"refusing non-https URL: {url}"
+        raise ValueError(msg)
+    try:
+        return _http_get_json_urllib(url, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if not isinstance(exc.reason, ssl.SSLError):
+            raise
+        return _http_get_json_curl(url, timeout=timeout)
+
+
+def _cve_metric_score(metrics: dict[str, Any]) -> tuple[float | None, str | None]:
+    """Pick the best available CVSS score+severity out of an NVD ``metrics`` block."""
+    for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        entries = metrics.get(key)
+        if not entries:
+            continue
+        cvss_data = entries[0].get("cvssData", {})
+        score = cvss_data.get("baseScore")
+        if score is None:
+            continue
+        severity = entries[0].get("baseSeverity") or cvss_data.get("baseSeverity")
+        return float(score), (str(severity).lower() if severity else None)
+    return None, None
+
+
+def _summarize_cve_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Reduce one NVD ``vulnerabilities[]`` entry to the fields a hunter needs."""
+    cve = item.get("cve", {})
+    descriptions = cve.get("descriptions") or []
+    summary = next((d.get("value", "") for d in descriptions if d.get("lang") == "en"), "")
+    score, severity = _cve_metric_score(cve.get("metrics") or {})
+    references = [ref.get("url") for ref in (cve.get("references") or []) if ref.get("url")]
+    return {
+        "id": cve.get("id", ""),
+        "published": cve.get("published", ""),
+        "cvss_score": score,
+        "severity": severity,
+        "summary": summary[:_CVE_SEARCH_SUMMARY_CHARS],
+        "references": references[:_CVE_SEARCH_MAX_REFERENCES],
+    }
+
+
+def cmd_cve_search(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    """Query the NVD CVE API for a product (+ optional version) and rank the hits.
+
+    Ranked by CVSS score (highest first), then by publish date (most recent first).
+    This lists *candidates* for a hunter to verify against the actual affected-version
+    range and reachability — it is not itself a confirmed finding.
+    """
+    query = args.product if not args.version else f"{args.product} {args.version}"
+    params = {
+        "keywordSearch": query,
+        "resultsPerPage": str(_CVE_SEARCH_RESULTS_PER_PAGE),
+    }
+    url = f"{_NVD_CVE_API_URL}?{urllib.parse.urlencode(params)}"
+    payload = _http_get_json(url, timeout=_CVE_SEARCH_TIMEOUT_SECONDS)
+    results = [_summarize_cve_item(item) for item in payload.get("vulnerabilities", [])]
+    results.sort(key=lambda row: (row["cvss_score"] or 0.0, row["published"]), reverse=True)
+    results = results[:_CVE_SEARCH_MAX_RESULTS]
+    return {
+        "product": args.product,
+        "version": args.version or None,
+        "query": query,
+        "total_results": payload.get("totalResults", len(results)),
+        "results": results,
+    }, 0
 
 
 # --------------------------------------------------------------------------- run-dir readers
@@ -1454,6 +1584,9 @@ def build_parser() -> argparse.ArgumentParser:
     pre.add_argument("--run-dir", default="", help="record the result in <run-dir>/run.json")
     score = add("cvss", "compute a CVSS 3.1 base score")
     score.add_argument("metrics", nargs=8, metavar="METRIC", help="AV AC PR UI S C I A")
+    cve = add("cve-search", "query the NVD CVE API for a product (+ optional version)")
+    cve.add_argument("product", help="product/appliance name, e.g. 'cPanel WHM'")
+    cve.add_argument("--version", default="", help="exact fingerprinted version, if known")
     for name, help_text in (
         ("verify", "run the schema checks (exit 2 on failure)"),
         ("status", "count items per stage and list open follow-ups"),
@@ -1467,6 +1600,7 @@ _COMMANDS = {
     "init": cmd_init,
     "preflight": cmd_preflight,
     "cvss": cmd_cvss,
+    "cve-search": cmd_cve_search,
     "verify": cmd_verify,
     "status": cmd_status,
     "assemble": cmd_assemble,
