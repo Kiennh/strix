@@ -29,6 +29,12 @@ Mark anything unobserved as "inferred". A partial black-box model that says what
 
 A table with columns `hunter | vuln classes | component/surface | knowledge packs (<=5) | priority | budget(turns)`. One row per hunter, count within the mode cap. Choose packs from `skills/strix-team/references/hunter-catalog.md` (every name must exist under `SKILLS_ROOT`); split by class cluster x component, not by the whole app. Then a short rationale and a "Deferred / out of scope" list. Use the mode's hunter turn budget.
 
+**Known-CVE matching is mandatory, not optional, for every fingerprinted product+version.** For each row in a mapping agent's "Fingerprinted versions" table:
+
+- Check the hunter-catalog's "Technology add-ons" table for a pack matching that product (Django, FastAPI, NestJS, Next.js, Firebase, Supabase, Auth0, Electron, Active Directory, Grafana/Prometheus). If matched, add that pack to the hunter who covers that component.
+- If there is **no matching pack** — this is the common case, most stacks (cPanel/WHM, WordPress, Jenkins, a load balancer, a VPN appliance, a random CMS or library) have none — do not skip it. Add a `vuln classes` entry literally named `CVE lookup: <product> <exact version>` to the hunter covering that component, with an instruction line in the rationale: "search the vendor advisory / NVD for `<product> <version>`, confirm whether the fingerprinted version falls inside the affected range, and if so open a candidate — do not assume no local pack means no known vulnerability." A version recon marked `unknown` gets `CVE lookup: <product> (version unconfirmed)` instead, and the hunter's first job is pinning the version before searching.
+- This duty lands on whichever hunter already owns that component; do not spawn a hunter solely for CVE lookup unless no existing row covers that surface.
+
 ## Wave 6: fold-in
 
 Read `amendments/*.md` and the current model. Rewrite `threat_model.md` so boundaries the scan confirmed or disproved say so, and update the diagram. You have no delete tool: list every amendment file you folded in your return so the lead can remove it. If the body already matches what the scan found, change nothing.

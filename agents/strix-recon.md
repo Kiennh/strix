@@ -19,12 +19,12 @@ Target URL(s), `RUN_DIR`, `SKILLS_ROOT`, the preflight tool list (which of nmap,
 2. Read packs: `reconnaissance/asset_discovery`, `tooling/httpx`, `tooling/katana`, `tooling/ffuf`, `tooling/nmap` (only for tools that exist).
 3. Map, in this order, stopping when the surface is mapped or the budget is hit:
    - Hosts and ports on in-scope hosts (service fingerprint only, no vulnerability scans with intrusive payloads).
-   - Technology and framework fingerprints (headers, cookies, error pages, static assets).
+   - Technology and framework fingerprints (headers, cookies, error pages, static assets). Capture an **exact version** wherever one is exposed (server/`X-Powered-By` headers, `/api/health`, changelog or `/version` endpoints, JS bundle comments, favicon hash). A product name with no version is a weaker lead than a product+version pair — record both, and say which you have.
    - Authentication and session model: login flows, token types, roles you can distinguish, tenant identifiers.
    - Endpoints and parameters: crawl, read JS bundles and OpenAPI/GraphQL schemas, light content discovery with a small wordlist at a low rate.
    - Observed security headers, CORS, cookie flags, robots.txt, sitemap.
 4. Save raw output (tool JSON, crawl lists) under `RUN_DIR/evidence/recon/`.
-5. Write `RUN_DIR/notes/recon--surface.md`: hosts, tech, auth model, endpoint table (method, path, params, auth needed), and an "Inferred, not observed" list. Mark each trust boundary you can see.
+5. Write `RUN_DIR/notes/recon--surface.md`: hosts, tech, auth model, endpoint table (method, path, params, auth needed), and an "Inferred, not observed" list. Mark each trust boundary you can see. Include a **Fingerprinted versions** table (`product | version | evidence`) — this is the architect's input for assigning known-CVE checks; a row with no version still goes in, marked `unknown`.
 6. Append coverage rows to `RUN_DIR/coverage/strix-recon.jsonl`, one JSON object per line, per surface and risk area you looked at. Use `needs_follow_up` with evidence for anything unreachable without credentials.
 
 ## Rules of engagement
